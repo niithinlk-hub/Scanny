@@ -135,6 +135,8 @@ class Strategy(ABC):
     """Base strategy class. Subclasses implement generate_signals + per-bar logic."""
 
     name: str = "Base"
+    default_interval: str = "1d"
+    is_intraday: bool = False
 
     def __init__(self, **params):
         self.params = params
@@ -423,9 +425,363 @@ class TripleThreatStrategy(Strategy):
         return None
 
 
+# =============================================================================
+# Strategy 3: Intraday Opening Range Breakout (ORB) on "stocks in play"
+# =============================================================================
+
+class IntradayORBStrategy(Strategy):
+    name = "Intraday ORB"
+    default_interval = "5m"
+    is_intraday = True
+
+    def __init__(self, or_minutes: int = 15, bar_minutes: int = 5,
+                 gap_threshold_pct: float = 1.0, rv_threshold: float = 3.0,
+                 breakout_buffer: float = 0.0015, vol_multiplier: float = 1.5,
+                 sl_mode: str = "or_mid", r_multiple: float = 2.0,
+                 rv_lookback: int = 10, require_directional_gap: bool = False):
+        super().__init__(or_minutes=or_minutes, bar_minutes=bar_minutes,
+                         gap_threshold_pct=gap_threshold_pct,
+                         rv_threshold=rv_threshold,
+                         breakout_buffer=breakout_buffer,
+                         vol_multiplier=vol_multiplier,
+                         sl_mode=sl_mode, r_multiple=r_multiple,
+                         rv_lookback=rv_lookback,
+                         require_directional_gap=require_directional_gap)
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+
+        bars_per_or = max(1, int(self.params["or_minutes"] // self.params["bar_minutes"]))
+        df["_date"] = df.index.date
+
+        for c in ("or_high", "or_low", "or_mid", "or_height",
+                  "gap_pct", "rel_vol_15", "entry_price", "stop_price",
+                  "target_price"):
+            df[c] = np.nan
+        df["signal"] = 0
+        df["reason"] = ""
+
+        day_groups = list(df.groupby("_date", sort=True))
+        day_dates = [d for d, _ in day_groups]
+
+        first_or_vol: Dict = {}
+        first_open: Dict = {}
+        last_close: Dict = {}
+        for d, g in day_groups:
+            first_or_vol[d] = float(g.iloc[:bars_per_or]["Volume"].sum())
+            first_open[d] = float(g.iloc[0]["Open"])
+            last_close[d] = float(g.iloc[-1]["Close"])
+
+        rv_lb = int(self.params["rv_lookback"])
+        buf = float(self.params["breakout_buffer"])
+        vm = float(self.params["vol_multiplier"])
+        gap_thr = float(self.params["gap_threshold_pct"])
+        rv_thr = float(self.params["rv_threshold"])
+
+        for di, (d, g) in enumerate(day_groups):
+            or_bars = g.iloc[:bars_per_or]
+            if len(or_bars) < bars_per_or:
+                continue
+            or_high = float(or_bars["High"].max())
+            or_low = float(or_bars["Low"].min())
+            or_mid = (or_high + or_low) / 2.0
+            or_height = or_high - or_low
+            or_vol_avg = float(or_bars["Volume"].mean()) if len(or_bars) else 0.0
+
+            prev_close = last_close[day_dates[di - 1]] if di > 0 else None
+            today_open = first_open[d]
+            gap_pct = ((today_open / prev_close - 1) * 100) if prev_close else 0.0
+
+            prior_vols = [first_or_vol[day_dates[j]]
+                          for j in range(max(0, di - rv_lb), di)]
+            avg_prior = float(np.mean(prior_vols)) if prior_vols else np.nan
+            rv_15 = (first_or_vol[d] / avg_prior) if avg_prior and avg_prior > 0 else 0.0
+
+            mask = df["_date"] == d
+            df.loc[mask, "or_high"] = or_high
+            df.loc[mask, "or_low"] = or_low
+            df.loc[mask, "or_mid"] = or_mid
+            df.loc[mask, "or_height"] = or_height
+            df.loc[mask, "gap_pct"] = gap_pct
+            df.loc[mask, "rel_vol_15"] = rv_15
+
+            in_play = (abs(gap_pct) >= gap_thr) and (rv_15 >= rv_thr)
+            if not in_play:
+                continue
+
+            post = g.iloc[bars_per_or:]
+            triggered = False
+            for ts, row in post.iterrows():
+                if triggered:
+                    break
+                bar_close = float(row["Close"])
+                bar_vol = float(row["Volume"])
+                vol_ok = bar_vol >= vm * or_vol_avg if or_vol_avg > 0 else True
+
+                long_brk = bar_close > or_high * (1 + buf)
+                short_brk = bar_close < or_low * (1 - buf)
+                if self.params["require_directional_gap"]:
+                    long_brk = long_brk and gap_pct > 0
+                    short_brk = short_brk and gap_pct < 0
+
+                if long_brk and vol_ok:
+                    entry = bar_close
+                    stop = or_mid if self.params["sl_mode"] == "or_mid" else or_low * (1 - buf)
+                    if stop >= entry:
+                        stop = entry * 0.99
+                    risk = entry - stop
+                    target = entry + self.params["r_multiple"] * risk
+                    df.at[ts, "signal"] = 1
+                    df.at[ts, "entry_price"] = entry
+                    df.at[ts, "stop_price"] = stop
+                    df.at[ts, "target_price"] = target
+                    df.at[ts, "reason"] = (
+                        f"5m ORB LONG: gap {gap_pct:.1f}%, rel_vol_15={rv_15:.1f}x; "
+                        f"breakout above OR_high={or_high:.2f} with vol "
+                        f"{(bar_vol / (or_vol_avg or 1)):.1f}x OR avg. "
+                        f"Entry={entry:.2f}, SL={stop:.2f}, TP={target:.2f}."
+                    )
+                    triggered = True
+                elif short_brk and vol_ok:
+                    entry = bar_close
+                    stop = or_mid if self.params["sl_mode"] == "or_mid" else or_high * (1 + buf)
+                    if stop <= entry:
+                        stop = entry * 1.01
+                    risk = stop - entry
+                    target = entry - self.params["r_multiple"] * risk
+                    df.at[ts, "signal"] = -1
+                    df.at[ts, "entry_price"] = entry
+                    df.at[ts, "stop_price"] = stop
+                    df.at[ts, "target_price"] = target
+                    df.at[ts, "reason"] = (
+                        f"5m ORB SHORT: gap {gap_pct:.1f}%, rel_vol_15={rv_15:.1f}x; "
+                        f"breakdown below OR_low={or_low:.2f} with vol "
+                        f"{(bar_vol / (or_vol_avg or 1)):.1f}x OR avg. "
+                        f"Entry={entry:.2f}, SL={stop:.2f}, TP={target:.2f}."
+                    )
+                    triggered = True
+
+        df.drop(columns=["_date"], inplace=True)
+        return df
+
+    def initial_stop(self, df: pd.DataFrame, i: int, direction: int) -> float:
+        s = df["stop_price"].iloc[i]
+        if pd.isna(s):
+            return float(df["Low"].iloc[i] * 0.99) if direction == 1 else float(df["High"].iloc[i] * 1.01)
+        return float(s)
+
+    def backtest(self, df: pd.DataFrame, **kwargs) -> Tuple[List[Trade], pd.DataFrame]:
+        df = self.generate_signals(df).copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        df["_d"] = df.index.date
+
+        trades: List[Trade] = []
+        for d, g in df.groupby("_d", sort=True):
+            open_trade: Optional[Trade] = None
+            for ts, row in g.iterrows():
+                price_h = float(row["High"])
+                price_l = float(row["Low"])
+
+                if open_trade is not None:
+                    d_dir = open_trade.direction
+                    hit_stop = (price_l <= open_trade.stop) if d_dir == 1 else (price_h >= open_trade.stop)
+                    hit_tgt = (price_h >= open_trade.target) if d_dir == 1 else (price_l <= open_trade.target)
+                    if hit_stop:
+                        exit_price = open_trade.stop
+                        open_trade.exit_date = ts
+                        open_trade.exit_price = exit_price
+                        open_trade.exit_reason = "stop"
+                        risk = abs(open_trade.entry_price - open_trade.stop) or 1e-9
+                        open_trade.r_multiple = (exit_price - open_trade.entry_price) * d_dir / risk
+                        open_trade.pnl_pct = (exit_price - open_trade.entry_price) * d_dir / open_trade.entry_price
+                        trades.append(open_trade)
+                        open_trade = None
+                        continue
+                    if hit_tgt:
+                        exit_price = open_trade.target
+                        open_trade.exit_date = ts
+                        open_trade.exit_price = exit_price
+                        open_trade.exit_reason = "target"
+                        risk = abs(open_trade.entry_price - open_trade.stop) or 1e-9
+                        open_trade.r_multiple = (exit_price - open_trade.entry_price) * d_dir / risk
+                        open_trade.pnl_pct = (exit_price - open_trade.entry_price) * d_dir / open_trade.entry_price
+                        trades.append(open_trade)
+                        open_trade = None
+                        continue
+
+                if open_trade is None and int(row.get("signal", 0)) != 0:
+                    direction = int(row["signal"])
+                    open_trade = Trade(
+                        entry_date=ts, exit_date=None, direction=direction,
+                        entry_price=float(row["entry_price"]), exit_price=None,
+                        stop=float(row["stop_price"]),
+                        target=float(row["target_price"]),
+                    )
+
+            if open_trade is not None:
+                last_ts = g.index[-1]
+                last_c = float(g.iloc[-1]["Close"])
+                open_trade.exit_date = last_ts
+                open_trade.exit_price = last_c
+                open_trade.exit_reason = "session_end"
+                d_dir = open_trade.direction
+                risk = abs(open_trade.entry_price - open_trade.stop) or 1e-9
+                open_trade.r_multiple = (last_c - open_trade.entry_price) * d_dir / risk
+                open_trade.pnl_pct = (last_c - open_trade.entry_price) * d_dir / open_trade.entry_price
+                trades.append(open_trade)
+
+        df.drop(columns=["_d"], inplace=True)
+        equity = build_equity_curve(df.index, trades)
+        return trades, equity
+
+
+# =============================================================================
+# Strategy 4: BTST (Buy Today, Sell Tomorrow) — overnight momentum
+# =============================================================================
+
+class BTSTStrategy(Strategy):
+    name = "BTST"
+    default_interval = "1d"
+    is_intraday = False
+
+    def __init__(self, min_day_pct: float = 2.0, close_in_range_thr: float = 0.8,
+                 vol_rel_min: float = 2.0, vol_lookback: int = 20,
+                 target_pct: float = 2.5, sl_mode: str = "day_extreme"):
+        super().__init__(min_day_pct=min_day_pct,
+                         close_in_range_thr=close_in_range_thr,
+                         vol_rel_min=vol_rel_min, vol_lookback=vol_lookback,
+                         target_pct=target_pct, sl_mode=sl_mode)
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        prev_close = df["Close"].shift(1)
+        df["day_return_pct"] = (df["Close"] / prev_close - 1) * 100
+        vol_lb = int(self.params["vol_lookback"])
+        df["vol_avg"] = df["Volume"].rolling(vol_lb, min_periods=max(5, vol_lb // 2)).mean()
+        df["vol_rel"] = df["Volume"] / df["vol_avg"].replace(0, np.nan)
+        rng = (df["High"] - df["Low"]).replace(0, np.nan)
+        df["close_pos"] = (df["Close"] - df["Low"]) / rng
+
+        long_cond = (
+            (df["day_return_pct"] >= self.params["min_day_pct"]) &
+            (df["close_pos"] >= self.params["close_in_range_thr"]) &
+            (df["vol_rel"] >= self.params["vol_rel_min"])
+        )
+        short_cond = (
+            (df["day_return_pct"] <= -self.params["min_day_pct"]) &
+            ((1 - df["close_pos"]) >= self.params["close_in_range_thr"]) &
+            (df["vol_rel"] >= self.params["vol_rel_min"])
+        )
+        df["signal"] = np.where(long_cond.fillna(False), 1,
+                                np.where(short_cond.fillna(False), -1, 0))
+
+        df["entry_price"] = np.where(df["signal"] != 0, df["Close"], np.nan)
+        df["stop_price"] = np.where(df["signal"] == 1, df["Low"],
+                            np.where(df["signal"] == -1, df["High"], np.nan))
+        tgt_pct = float(self.params["target_pct"]) / 100.0
+        df["target_price"] = np.where(
+            df["signal"] == 1, df["Close"] * (1 + tgt_pct),
+            np.where(df["signal"] == -1, df["Close"] * (1 - tgt_pct), np.nan)
+        )
+
+        reasons: List[str] = []
+        for _, r in df.iterrows():
+            s = int(r["signal"]) if not pd.isna(r["signal"]) else 0
+            if s == 1:
+                reasons.append(
+                    f"BTST LONG: +{r['day_return_pct']:.1f}% day, close near HOD "
+                    f"({r['close_pos']:.0%} of range), vol {r['vol_rel']:.1f}x {vol_lb}D avg. "
+                    f"Entry={r['entry_price']:.2f}, SL={r['stop_price']:.2f}, TP={r['target_price']:.2f}. "
+                    f"Expect overnight continuation."
+                )
+            elif s == -1:
+                reasons.append(
+                    f"BTST SHORT: {r['day_return_pct']:.1f}% day, close near LOD "
+                    f"({(1 - r['close_pos']):.0%} of range), vol {r['vol_rel']:.1f}x {vol_lb}D avg. "
+                    f"Entry={r['entry_price']:.2f}, SL={r['stop_price']:.2f}, TP={r['target_price']:.2f}."
+                )
+            else:
+                reasons.append("")
+        df["reason"] = reasons
+        return df
+
+    def initial_stop(self, df: pd.DataFrame, i: int, direction: int) -> float:
+        s = df["stop_price"].iloc[i]
+        if pd.isna(s):
+            return float(df["Low"].iloc[i]) if direction == 1 else float(df["High"].iloc[i])
+        return float(s)
+
+    def backtest(self, df: pd.DataFrame, **kwargs) -> Tuple[List[Trade], pd.DataFrame]:
+        df = self.generate_signals(df).copy()
+        trades: List[Trade] = []
+        sigs = df["signal"].values
+        opens = df["Open"].values
+        highs = df["High"].values
+        lows = df["Low"].values
+        closes = df["Close"].values
+        stops = df["stop_price"].values
+        targets = df["target_price"].values
+        entries = df["entry_price"].values
+        idx = df.index
+
+        for i in range(len(df) - 1):
+            s = int(sigs[i])
+            if s == 0:
+                continue
+            entry = float(entries[i])
+            stop = float(stops[i])
+            target = float(targets[i])
+            d2_open = float(opens[i + 1])
+            d2_high = float(highs[i + 1])
+            d2_low = float(lows[i + 1])
+            d2_close = float(closes[i + 1])
+
+            if s == 1:
+                gap_hits_stop = d2_open <= stop
+                gap_hits_tgt = d2_open >= target
+                intraday_stop = d2_low <= stop
+                intraday_tgt = d2_high >= target
+            else:
+                gap_hits_stop = d2_open >= stop
+                gap_hits_tgt = d2_open <= target
+                intraday_stop = d2_high >= stop
+                intraday_tgt = d2_low <= target
+
+            if gap_hits_stop:
+                exit_price, reason = d2_open, "gap_stop"
+            elif gap_hits_tgt:
+                exit_price, reason = d2_open, "gap_target"
+            elif intraday_tgt and not intraday_stop:
+                exit_price, reason = target, "target"
+            elif intraday_stop and not intraday_tgt:
+                exit_price, reason = stop, "stop"
+            elif intraday_stop and intraday_tgt:
+                exit_price, reason = stop, "stop_first_conservative"
+            else:
+                exit_price, reason = d2_close, "day2_close"
+
+            risk = abs(entry - stop) or 1e-9
+            pnl = (exit_price - entry) * s
+            trades.append(Trade(
+                entry_date=idx[i], exit_date=idx[i + 1], direction=s,
+                entry_price=entry, exit_price=exit_price,
+                stop=stop, target=target,
+                r_multiple=pnl / risk, pnl_pct=pnl / entry,
+                exit_reason=reason,
+            ))
+
+        equity = build_equity_curve(df.index, trades)
+        return trades, equity
+
+
 STRATEGIES: Dict[str, type] = {
     "MACD Money Map": MoneyMapStrategy,
     "Triple Threat": TripleThreatStrategy,
+    "Intraday ORB": IntradayORBStrategy,
+    "BTST": BTSTStrategy,
 }
 
 
@@ -653,31 +1009,65 @@ def summarize(trades: List[Trade], equity: pd.DataFrame) -> dict:
 # Screener
 # =============================================================================
 
+def _latest_signal_row(sigdf: pd.DataFrame, intraday: bool) -> Optional[pd.Series]:
+    """Return latest row in the most recent session day that has signal != 0; else None.
+
+    Daily strategies: only check the last bar.
+    Intraday strategies: scan the last available session day for any signal.
+    """
+    if sigdf.empty or "signal" not in sigdf.columns:
+        return None
+    nz = sigdf[sigdf["signal"] != 0]
+    if nz.empty:
+        return None
+    if not intraday:
+        last = sigdf.iloc[-1]
+        return last if int(last["signal"]) != 0 else None
+    last_date = sigdf.index[-1].date() if hasattr(sigdf.index[-1], "date") else None
+    if last_date is not None and hasattr(nz.index[-1], "date"):
+        same_day = nz[[ts.date() == last_date for ts in nz.index]]
+        if not same_day.empty:
+            return same_day.iloc[-1]
+    return nz.iloc[-1]
+
+
 def screen_tickers(data: Dict[str, pd.DataFrame], strategy: Strategy
                    ) -> pd.DataFrame:
     rows = []
+    intraday = bool(strategy.is_intraday)
     for t, df in data.items():
         try:
             sigdf = strategy.generate_signals(df)
-            last = sigdf.iloc[-1]
-            sig_today = int(last.get("signal", 0))
+            last_bar = sigdf.iloc[-1]
+            close_now = round(float(last_bar["Close"]), 4)
+
+            sig_row = _latest_signal_row(sigdf, intraday)
+            sig_today = int(sig_row["signal"]) if sig_row is not None else 0
             sig_label = "LONG" if sig_today == 1 else ("SHORT" if sig_today == -1 else "—")
-            row = {
-                "ticker": t,
-                "close": round(float(last["Close"]), 4),
-                "signal": sig_label,
-                "macd": round(float(last.get("macd", np.nan)), 4),
-                "macd_signal": round(float(last.get("macd_signal", np.nan)), 4),
-                "macd_hist": round(float(last.get("macd_hist", np.nan)), 4),
-            }
-            if "rsi" in sigdf.columns:
-                row["rsi"] = round(float(last["rsi"]), 2)
-            if "stoch_k" in sigdf.columns:
-                row["stoch_k"] = round(float(last["stoch_k"]), 2)
-                row["stoch_d"] = round(float(last["stoch_d"]), 2)
+
+            row = {"ticker": t, "close": close_now, "signal": sig_label}
+
+            if sig_row is not None and sig_today != 0:
+                row["signal_time"] = sig_row.name
+                for c in ("entry_price", "stop_price", "target_price"):
+                    if c in sig_row and not pd.isna(sig_row[c]):
+                        row[c] = round(float(sig_row[c]), 4)
+                if "reason" in sig_row:
+                    row["reason"] = str(sig_row["reason"])[:300]
+
+            for c in ("gap_pct", "rel_vol_15"):
+                if c in sigdf.columns and not pd.isna(last_bar.get(c, np.nan)):
+                    row[c] = round(float(last_bar[c]), 3)
+            for c in ("day_return_pct", "close_pos", "vol_rel"):
+                if c in sigdf.columns and not pd.isna(last_bar.get(c, np.nan)):
+                    row[c] = round(float(last_bar[c]), 3)
+            for c in ("macd", "macd_signal", "macd_hist", "rsi", "stoch_k", "stoch_d"):
+                if c in sigdf.columns and not pd.isna(last_bar.get(c, np.nan)):
+                    row[c] = round(float(last_bar[c]), 3)
+
             rows.append(row)
         except Exception as e:
-            rows.append({"ticker": t, "close": None, "signal": "ERR", "error": str(e)[:60]})
+            rows.append({"ticker": t, "close": None, "signal": "ERR", "error": str(e)[:80]})
     return pd.DataFrame(rows)
 
 
@@ -725,6 +1115,28 @@ def make_price_chart(df: pd.DataFrame, trades: List[Trade], ticker: str,
         colors = ["#16a34a" if v >= 0 else "#dc2626" for v in df["macd_hist"].fillna(0)]
         fig.add_trace(go.Bar(x=df.index, y=df["macd_hist"], name="Hist",
                              marker_color=colors, opacity=0.5), row=2, col=1)
+        fig.add_hline(y=0, line_color="#888", line_dash="dot", row=2, col=1)
+
+    if "or_high" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["or_high"], name="OR High",
+                                 line=dict(color="#16a34a", width=1, dash="dot"),
+                                 connectgaps=False), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["or_low"], name="OR Low",
+                                 line=dict(color="#dc2626", width=1, dash="dot"),
+                                 connectgaps=False), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["or_mid"], name="OR Mid",
+                                 line=dict(color="#9ca3af", width=1, dash="dash"),
+                                 connectgaps=False), row=1, col=1)
+        if "rel_vol_15" in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df["rel_vol_15"], name="RelVol_15",
+                                     line=dict(color="#7c3aed")), row=2, col=1)
+            fig.add_hline(y=1.0, line_color="#888", line_dash="dot", row=2, col=1)
+
+    if "day_return_pct" in df.columns and "macd" not in df.columns:
+        fig.add_trace(go.Bar(x=df.index, y=df["day_return_pct"], name="Day %",
+                             marker_color=["#16a34a" if v >= 0 else "#dc2626"
+                                           for v in df["day_return_pct"].fillna(0)],
+                             opacity=0.6), row=2, col=1)
         fig.add_hline(y=0, line_color="#888", line_dash="dot", row=2, col=1)
 
     if "Volume" in df.columns:
@@ -801,18 +1213,62 @@ def sidebar_inputs() -> dict:
         except Exception as e:
             st.sidebar.error(f"CSV read failed: {e}")
 
-    st.sidebar.markdown("### 3. Date range & timeframe")
+    st.sidebar.markdown("### 3. Strategy")
+    strat_name = st.sidebar.selectbox("Strategy", list(STRATEGIES.keys()))
+    strat_cls = STRATEGIES[strat_name]
+    forced_interval = strat_cls.default_interval
+    is_intraday = strat_cls.is_intraday
+
+    strat_params: dict = {}
+    with st.sidebar.expander("Strategy parameters", expanded=False):
+        if strat_name == "Intraday ORB":
+            strat_params["or_minutes"] = st.number_input("OR window (min)",
+                value=15, min_value=5, max_value=60, step=5)
+            strat_params["bar_minutes"] = 5
+            strat_params["gap_threshold_pct"] = st.number_input("Gap threshold %",
+                value=1.0, min_value=0.0, max_value=10.0, step=0.25)
+            strat_params["rv_threshold"] = st.number_input("RelVol 15m threshold (x)",
+                value=3.0, min_value=0.5, max_value=20.0, step=0.5)
+            strat_params["breakout_buffer"] = st.number_input("Breakout buffer (frac)",
+                value=0.0015, min_value=0.0, max_value=0.01, step=0.0005, format="%.4f")
+            strat_params["vol_multiplier"] = st.number_input("Breakout vol mult (x OR avg)",
+                value=1.5, min_value=0.0, max_value=10.0, step=0.25)
+            strat_params["r_multiple"] = st.number_input("R multiple (target)",
+                value=2.0, min_value=0.5, max_value=10.0, step=0.5)
+            strat_params["sl_mode"] = st.selectbox("Stop-loss mode",
+                options=["or_mid", "or_extreme"], index=0)
+            strat_params["require_directional_gap"] = st.checkbox(
+                "Require gap aligned with breakout direction", value=False)
+        elif strat_name == "BTST":
+            strat_params["min_day_pct"] = st.number_input("Min day return %",
+                value=2.0, min_value=0.5, max_value=15.0, step=0.5)
+            strat_params["close_in_range_thr"] = st.number_input("Close-in-range threshold",
+                value=0.8, min_value=0.5, max_value=1.0, step=0.05)
+            strat_params["vol_rel_min"] = st.number_input("Min relative volume (x)",
+                value=2.0, min_value=0.5, max_value=10.0, step=0.5)
+            strat_params["vol_lookback"] = st.number_input("Vol lookback (days)",
+                value=20, min_value=5, max_value=60, step=5)
+            strat_params["target_pct"] = st.number_input("Target % (overnight)",
+                value=2.5, min_value=0.5, max_value=10.0, step=0.5)
+        else:
+            st.caption("Defaults used (MACD strategies).")
+
+    st.sidebar.markdown("### 4. Date range & timeframe")
     today = date.today()
-    default_start = today - timedelta(days=365 * 3)
+    if is_intraday:
+        default_start = today - timedelta(days=30)
+        max_back = today - timedelta(days=58)  # Yahoo ~60-day cap for 5m
+        st.sidebar.caption("⚠️ Intraday (5m) — Yahoo limits history to ~60 days.")
+    else:
+        default_start = today - timedelta(days=365 * 3)
+        max_back = today - timedelta(days=365 * 10)
     start = st.sidebar.date_input("Start date", value=default_start,
+                                  min_value=max_back,
                                   max_value=today - timedelta(days=1))
     end = st.sidebar.date_input("End date", value=today, max_value=today)
-    interval = st.sidebar.selectbox("Timeframe",
-                                    options=["1d", "1wk", "1h"], index=0,
-                                    help="Daily recommended. Intraday limited by Yahoo history.")
+    st.sidebar.caption(f"Interval (auto from strategy): **{forced_interval}**")
+    interval = forced_interval
 
-    st.sidebar.markdown("### 4. Strategy")
-    strat_name = st.sidebar.selectbox("Strategy", list(STRATEGIES.keys()))
     only_active = st.sidebar.checkbox("Show only tickers with active signal today",
                                       value=False)
 
@@ -837,6 +1293,7 @@ def sidebar_inputs() -> dict:
         "tickers": tickers, "universes": universes,
         "start": start, "end": end,
         "interval": interval, "strategy_name": strat_name,
+        "strat_params": strat_params,
         "only_active": only_active,
         "load_clicked": load_clicked, "clear_clicked": clear_clicked,
     }
@@ -1009,7 +1466,10 @@ def main() -> None:
         )
 
     strategy_cls = STRATEGIES[cfg["strategy_name"]]
-    strategy = strategy_cls()
+    try:
+        strategy = strategy_cls(**cfg.get("strat_params", {}))
+    except TypeError:
+        strategy = strategy_cls()
 
     render_data_status(loaded, skipped)
     if group_meta:
