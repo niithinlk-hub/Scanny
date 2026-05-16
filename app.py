@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
@@ -493,6 +494,114 @@ def clean_download_result(raw: pd.DataFrame, tickers: List[str]
 
 
 # =============================================================================
+# Ticker universes (NASDAQ-100, S&P 500, NSE NIFTY 500)
+# =============================================================================
+
+_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/123.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# Minimal embedded fallbacks if network/wikipedia/NSE fetch fails
+_FALLBACK_SP500 = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","LLY","AVGO",
+    "TSLA","JPM","V","WMT","UNH","XOM","MA","PG","JNJ","ORCL","HD","COST",
+    "ABBV","BAC","KO","CVX","NFLX","CRM","ADBE","MRK","PEP","TMO","AMD",
+    "LIN","CSCO","ACN","ABT","WFC","MCD","DHR","DIS","TXN","PM","IBM","CAT",
+    "INTU","GE","VZ","NOW","QCOM","UNP","NEE","SPGI","PFE","RTX","CMCSA",
+    "AMGN","ISRG","HON","T","MS","AMAT","GS","BLK","BKNG","LOW","NKE","UPS",
+]
+_FALLBACK_NDX = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","TSLA","COST",
+    "NFLX","ADBE","PEP","AMD","CSCO","TMUS","CMCSA","INTC","QCOM","TXN",
+    "AMGN","INTU","ISRG","HON","BKNG","AMAT","SBUX","VRTX","ADI","LRCX",
+    "MU","GILD","ADP","PANW","REGN","PYPL","KLAC","MELI","SNPS","CDNS",
+    "MAR","CTAS","FTNT","ASML","ABNB","ORLY","CRWD","ROP","CHTR","NXPI",
+]
+_FALLBACK_NSE = [
+    "RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS","HINDUNILVR.NS",
+    "ITC.NS","SBIN.NS","BHARTIARTL.NS","KOTAKBANK.NS","LT.NS","BAJFINANCE.NS",
+    "AXISBANK.NS","ASIANPAINT.NS","MARUTI.NS","HCLTECH.NS","SUNPHARMA.NS",
+    "TITAN.NS","ULTRACEMCO.NS","WIPRO.NS","NESTLEIND.NS","ONGC.NS","NTPC.NS",
+    "POWERGRID.NS","M&M.NS","TATAMOTORS.NS","TATASTEEL.NS","ADANIENT.NS",
+    "JSWSTEEL.NS","COALINDIA.NS","BAJAJFINSV.NS","HDFCLIFE.NS","SBILIFE.NS",
+    "DRREDDY.NS","CIPLA.NS","DIVISLAB.NS","BRITANNIA.NS","EICHERMOT.NS",
+    "GRASIM.NS","HEROMOTOCO.NS","HINDALCO.NS","INDUSINDBK.NS","BPCL.NS",
+    "TECHM.NS","UPL.NS","APOLLOHOSP.NS","TATACONSUM.NS","BAJAJ-AUTO.NS",
+    "ADANIPORTS.NS","SHRIRAMFIN.NS",
+]
+
+
+def _wiki_table(url: str, attempts: int = 2) -> List[pd.DataFrame]:
+    for _ in range(attempts):
+        try:
+            r = requests.get(url, headers=_HTTP_HEADERS, timeout=15)
+            r.raise_for_status()
+            return pd.read_html(io.StringIO(r.text))
+        except Exception:
+            continue
+    return []
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_sp500_tickers() -> List[str]:
+    tables = _wiki_table("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+    for tbl in tables:
+        col = next((c for c in tbl.columns if str(c).strip().lower() in ("symbol", "ticker")), None)
+        if col is not None:
+            tickers = [str(x).strip().upper().replace(".", "-") for x in tbl[col].dropna()]
+            tickers = [t for t in tickers if t.isascii() and 1 <= len(t) <= 8]
+            if len(tickers) > 100:
+                return sorted(set(tickers))
+    return list(_FALLBACK_SP500)
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_nasdaq100_tickers() -> List[str]:
+    tables = _wiki_table("https://en.wikipedia.org/wiki/Nasdaq-100")
+    for tbl in tables:
+        cols_l = [str(c).strip().lower() for c in tbl.columns]
+        col = None
+        for cand in ("ticker", "symbol"):
+            if cand in cols_l:
+                col = tbl.columns[cols_l.index(cand)]
+                break
+        if col is not None:
+            tickers = [str(x).strip().upper().replace(".", "-") for x in tbl[col].dropna()]
+            tickers = [t for t in tickers if t.isascii() and 1 <= len(t) <= 8]
+            if 50 <= len(tickers) <= 200:
+                return sorted(set(tickers))
+    return list(_FALLBACK_NDX)
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_nse500_tickers() -> List[str]:
+    url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+    try:
+        r = requests.get(url, headers=_HTTP_HEADERS, timeout=15)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        col = next((c for c in df.columns if "symbol" in c.lower()), None)
+        if col is not None:
+            tickers = [f"{str(x).strip().upper()}.NS" for x in df[col].dropna()]
+            tickers = [t for t in tickers if len(t) > 3]
+            if len(tickers) > 100:
+                return sorted(set(tickers))
+    except Exception:
+        pass
+    return list(_FALLBACK_NSE)
+
+
+UNIVERSE_LOADERS = {
+    "NASDAQ-100": fetch_nasdaq100_tickers,
+    "S&P 500": fetch_sp500_tickers,
+    "NSE (NIFTY 500)": fetch_nse500_tickers,
+}
+
+
+# =============================================================================
 # Backtest metrics & equity curve
 # =============================================================================
 
@@ -655,11 +764,30 @@ def sidebar_inputs() -> dict:
     st.sidebar.caption(APP_TAGLINE)
     st.sidebar.markdown("---")
 
-    default_tickers = "AAPL, MSFT, NVDA, RELIANCE.NS, TCS.NS, INFY.NS, HDFCBANK.NS"
-    text = st.sidebar.text_area("Tickers (comma / space separated)",
-                                value=default_tickers, height=110)
+    st.sidebar.markdown("### 1. Universe")
+    universes = st.sidebar.multiselect(
+        "Preloaded universes",
+        list(UNIVERSE_LOADERS.keys()),
+        default=["NASDAQ-100"],
+        help="Constituent lists fetched once and cached for 24h.",
+    )
 
-    uploaded = st.sidebar.file_uploader("...or upload CSV (column: ticker)",
+    with st.sidebar.expander("Universe preview / counts"):
+        for u in universes:
+            try:
+                lst = UNIVERSE_LOADERS[u]()
+                st.write(f"**{u}** — {len(lst)} tickers (e.g. {', '.join(lst[:6])} …)")
+            except Exception as e:
+                st.warning(f"{u}: fetch failed — {e}")
+
+    st.sidebar.markdown("### 2. Custom tickers (optional)")
+    text = st.sidebar.text_area(
+        "Add tickers (comma / space / newline separated)",
+        value="", height=80,
+        help="Merged with selected universes. Use Yahoo suffixes for non-US (.NS, .BO, .L).",
+    )
+
+    uploaded = st.sidebar.file_uploader("…or upload CSV (column: ticker)",
                                         type=["csv"])
     csv_tickers: List[str] = []
     if uploaded is not None:
@@ -673,31 +801,44 @@ def sidebar_inputs() -> dict:
         except Exception as e:
             st.sidebar.error(f"CSV read failed: {e}")
 
-    tickers = sorted(set(_parse_tickers(text) + csv_tickers))
-
-    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 3. Date range & timeframe")
     today = date.today()
     default_start = today - timedelta(days=365 * 3)
     start = st.sidebar.date_input("Start date", value=default_start,
                                   max_value=today - timedelta(days=1))
     end = st.sidebar.date_input("End date", value=today, max_value=today)
-
     interval = st.sidebar.selectbox("Timeframe",
                                     options=["1d", "1wk", "1h"], index=0,
                                     help="Daily recommended. Intraday limited by Yahoo history.")
 
+    st.sidebar.markdown("### 4. Strategy")
     strat_name = st.sidebar.selectbox("Strategy", list(STRATEGIES.keys()))
-
     only_active = st.sidebar.checkbox("Show only tickers with active signal today",
                                       value=False)
 
     st.sidebar.markdown("---")
+    load_clicked = st.sidebar.button("📥 Load Data", type="primary",
+                                     use_container_width=True)
+    clear_clicked = st.sidebar.button("🗑️ Clear loaded data",
+                                      use_container_width=True)
+
     st.sidebar.caption("Data: Yahoo Finance (yfinance). No commissions/slippage modeled.")
 
+    universe_tickers: List[str] = []
+    for u in universes:
+        try:
+            universe_tickers.extend(UNIVERSE_LOADERS[u]())
+        except Exception:
+            pass
+
+    tickers = sorted(set(universe_tickers + _parse_tickers(text) + csv_tickers))
+
     return {
-        "tickers": tickers, "start": start, "end": end,
+        "tickers": tickers, "universes": universes,
+        "start": start, "end": end,
         "interval": interval, "strategy_name": strat_name,
         "only_active": only_active,
+        "load_clicked": load_clicked, "clear_clicked": clear_clicked,
     }
 
 
@@ -766,6 +907,69 @@ def render_backtest(loaded: Dict[str, pd.DataFrame], strategy: Strategy,
         st.info("No trades generated for this ticker over the selected range.")
 
 
+def _do_load(cfg: dict) -> None:
+    if cfg["start"] >= cfg["end"]:
+        st.error("Start date must be before end date.")
+        return
+    if not cfg["tickers"]:
+        st.warning("No tickers selected. Pick a universe or add custom tickers.")
+        return
+
+    by_group: Dict[str, List[str]] = {u: list(UNIVERSE_LOADERS[u]()) for u in cfg["universes"]}
+    custom = [t for t in cfg["tickers"]
+              if all(t not in v for v in by_group.values())]
+    if custom:
+        by_group["Custom"] = custom
+
+    all_loaded: Dict[str, pd.DataFrame] = {}
+    all_skipped: List[str] = []
+    group_meta: Dict[str, dict] = {}
+
+    bar = st.progress(0.0, text="Starting download…")
+    n_groups = max(1, len(by_group))
+    for gi, (gname, glist) in enumerate(by_group.items()):
+        if not glist:
+            continue
+        bar.progress(gi / n_groups, text=f"Downloading {gname} ({len(glist)} tickers)…")
+        try:
+            raw = download_prices(
+                tuple(sorted(set(glist))),
+                start=cfg["start"].isoformat(),
+                end=cfg["end"].isoformat(),
+                interval=cfg["interval"],
+            )
+            loaded, skipped = clean_download_result(raw, glist)
+        except Exception as e:
+            st.error(f"{gname} download failed: {e}")
+            loaded, skipped = {}, list(glist)
+        all_loaded.update(loaded)
+        all_skipped.extend(skipped)
+        group_meta[gname] = {"requested": len(glist), "loaded": len(loaded),
+                             "skipped": len(skipped)}
+    bar.progress(1.0, text="Done.")
+    bar.empty()
+
+    st.session_state["scanny_loaded"] = all_loaded
+    st.session_state["scanny_skipped"] = sorted(set(all_skipped))
+    st.session_state["scanny_groups"] = group_meta
+    st.session_state["scanny_meta"] = {
+        "start": cfg["start"].isoformat(),
+        "end": cfg["end"].isoformat(),
+        "interval": cfg["interval"],
+        "universes": list(cfg["universes"]),
+        "n_custom": len(by_group.get("Custom", [])),
+    }
+
+
+def render_group_breakdown(group_meta: Dict[str, dict]) -> None:
+    if not group_meta:
+        return
+    rows = [{"Group": g, "Requested": m["requested"],
+             "Loaded": m["loaded"], "Skipped": m["skipped"]}
+            for g, m in group_meta.items()]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     st.set_page_config(page_title=f"{APP_NAME} — Screener & Backtester",
                        layout="wide", page_icon="⚡")
@@ -774,30 +978,43 @@ def main() -> None:
 
     cfg = sidebar_inputs()
 
-    if not cfg["tickers"]:
-        st.info("Enter tickers in the sidebar to begin.")
+    if cfg["clear_clicked"]:
+        for k in ("scanny_loaded", "scanny_skipped", "scanny_groups", "scanny_meta"):
+            st.session_state.pop(k, None)
+        st.success("Cleared loaded data.")
+
+    if cfg["load_clicked"]:
+        with st.spinner("Fetching data from Yahoo Finance…"):
+            _do_load(cfg)
+
+    loaded: Dict[str, pd.DataFrame] = st.session_state.get("scanny_loaded", {})
+    skipped: List[str] = st.session_state.get("scanny_skipped", [])
+    group_meta: Dict[str, dict] = st.session_state.get("scanny_groups", {})
+    meta = st.session_state.get("scanny_meta", {})
+
+    if not loaded:
+        st.info("Pick universes / add tickers in the sidebar, then click **📥 Load Data**.")
+        if cfg["tickers"]:
+            st.caption(f"Currently selected: {len(cfg['tickers'])} tickers across "
+                       f"{len(cfg['universes'])} universe(s) + "
+                       f"custom inputs. Nothing downloaded yet.")
         return
-    if cfg["start"] >= cfg["end"]:
-        st.error("Start date must be before end date.")
-        return
+
+    if meta:
+        st.caption(
+            f"Loaded {len(loaded)} tickers · {meta.get('interval')} · "
+            f"{meta.get('start')} → {meta.get('end')} · "
+            f"universes: {', '.join(meta.get('universes', []) or ['—'])}"
+            + (f" · {meta.get('n_custom')} custom" if meta.get('n_custom') else "")
+        )
 
     strategy_cls = STRATEGIES[cfg["strategy_name"]]
     strategy = strategy_cls()
 
-    with st.spinner(f"Downloading {len(cfg['tickers'])} tickers from Yahoo…"):
-        try:
-            raw = download_prices(
-                tuple(cfg["tickers"]),
-                start=cfg["start"].isoformat(),
-                end=cfg["end"].isoformat(),
-                interval=cfg["interval"],
-            )
-        except Exception as e:
-            st.error(f"Download failed: {e}")
-            return
-        loaded, skipped = clean_download_result(raw, cfg["tickers"])
-
     render_data_status(loaded, skipped)
+    if group_meta:
+        with st.expander("Per-universe load breakdown", expanded=False):
+            render_group_breakdown(group_meta)
     st.markdown("---")
     render_screener(loaded, strategy, cfg["only_active"])
     st.markdown("---")
